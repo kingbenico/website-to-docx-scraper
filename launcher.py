@@ -44,6 +44,22 @@ def open_browser():
     webbrowser.open(URL)
 
 
+def stop_app():
+    """Kill any lingering chromedriver/chrome processes then exit."""
+    import signal
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            subprocess.call(["taskkill", "/F", "/IM", "chromedriver.exe"], stderr=subprocess.DEVNULL)
+            subprocess.call(["taskkill", "/F", "/IM", "chrome.exe"], stderr=subprocess.DEVNULL)
+        else:
+            subprocess.call(["pkill", "-f", "chromedriver"], stderr=subprocess.DEVNULL)
+            subprocess.call(["pkill", "-f", "Google Chrome for Testing"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 def show_stop_window():
     try:
         import tkinter as tk
@@ -66,7 +82,7 @@ def show_stop_window():
         btn = tk.Button(
             root,
             text="Stop App",
-            command=lambda: sys.exit(0),
+            command=lambda: stop_app(),
             bg="#e53e3e",
             fg="white",
             font=("Helvetica", 12, "bold"),
@@ -77,7 +93,7 @@ def show_stop_window():
         )
         btn.pack()
 
-        root.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
+        root.protocol("WM_DELETE_WINDOW", lambda: stop_app())
         root.mainloop()
     except Exception:
         # tkinter unavailable — fall back to blocking loop
