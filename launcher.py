@@ -44,6 +44,51 @@ def open_browser():
     webbrowser.open(URL)
 
 
+def show_stop_window():
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.title("Site to DOCX")
+        root.resizable(False, False)
+        root.geometry("300x120")
+
+        # Keep window on top so it's easy to find
+        root.attributes("-topmost", True)
+
+        label = tk.Label(
+            root,
+            text=f"Site to DOCX is running.\n{URL}",
+            pady=16,
+            font=("Helvetica", 12),
+        )
+        label.pack()
+
+        btn = tk.Button(
+            root,
+            text="Stop App",
+            command=lambda: sys.exit(0),
+            bg="#e53e3e",
+            fg="white",
+            font=("Helvetica", 12, "bold"),
+            padx=20,
+            pady=6,
+            relief="flat",
+            cursor="hand2",
+        )
+        btn.pack()
+
+        root.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
+        root.mainloop()
+    except Exception:
+        # tkinter unavailable — fall back to blocking loop
+        print(f"App is running at {URL}. Press Ctrl+C to stop.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+
 if __name__ == "__main__":
     print(f"Starting Site to DOCX at {URL} ...")
 
@@ -53,13 +98,4 @@ if __name__ == "__main__":
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
 
-    # Keep the process alive — on Windows this shows a console window
-    # which also acts as a visual indicator that the app is running.
-    print(f"App is running. Open {URL} in your browser.")
-    print("Close this window to stop the app.")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Shutting down.")
-        sys.exit(0)
+    show_stop_window()

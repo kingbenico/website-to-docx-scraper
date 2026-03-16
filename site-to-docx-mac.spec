@@ -61,6 +61,9 @@ a = Analysis(
         'certifi',
         'charset_normalizer',
         'idna',
+        # UI
+        'tkinter',
+        'tkinter.ttk',
         # App modules
         'app',
         'scraper',
