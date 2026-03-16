@@ -8,7 +8,6 @@ from flask import Flask, jsonify, render_template, request, send_file
 
 app = Flask(__name__)
 
-ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "")
 
 # ==============================
 # JOB STORE
@@ -54,16 +53,6 @@ def _run_job(job_id: str, url: str):
                 jobs[job_id].error = str(e)
 
 # ==============================
-# AUTH
-# ==============================
-
-def _check_password():
-    if not ACCESS_PASSWORD:
-        return True  # no password set — open access
-    pw = request.form.get("password") or request.args.get("password") or request.headers.get("X-Password", "")
-    return pw == ACCESS_PASSWORD
-
-# ==============================
 # ROUTES
 # ==============================
 
@@ -74,8 +63,6 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
-    if not _check_password():
-        return jsonify({"error": "Unauthorized"}), 401
     url = request.form.get("url", "").strip()
     if not url:
         return jsonify({"error": "URL is required"}), 400
@@ -94,8 +81,6 @@ def start():
 
 @app.route("/status/<job_id>")
 def status(job_id):
-    if not _check_password():
-        return jsonify({"error": "Unauthorized"}), 401
     with jobs_lock:
         job = jobs.get(job_id)
 
@@ -123,8 +108,6 @@ def status(job_id):
 
 @app.route("/download/<job_id>")
 def download(job_id):
-    if not _check_password():
-        return jsonify({"error": "Unauthorized"}), 401
     with jobs_lock:
         job = jobs.get(job_id)
 
