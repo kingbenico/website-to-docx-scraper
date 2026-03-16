@@ -116,6 +116,10 @@ app = BUNDLE(
         'NSHighResolutionCapable': True,
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleName': 'Site to DOCX',
-        'LSUIElement': False,  # show in Dock while running
+        'LSUIElement': False,
+        'NSAppTransportSecurity': {
+            'NSAllowsLocalNetworking': True,
+            'NSAllowsArbitraryLoads': True,
+        },
     },
 )

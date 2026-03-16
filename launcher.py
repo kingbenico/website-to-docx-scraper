@@ -23,12 +23,17 @@ os.chdir(BASE_DIR)
 # Must be set before importing app so Flask finds the templates folder
 os.environ.setdefault("FLASK_ENV", "production")
 
-PORT = 5000
+def find_free_port():
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+PORT = find_free_port()
 URL = f"http://localhost:{PORT}"
 
 
 def start_flask():
-    # Import here so PyInstaller picks up all dependencies
     from app import app
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False)
 
