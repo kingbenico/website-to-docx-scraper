@@ -9,6 +9,7 @@ import threading
 import webbrowser
 import time
 
+
 # When bundled by PyInstaller, fix the working directory and path
 if getattr(sys, "frozen", False):
     # Running as .exe — set base dir to the temp extraction folder
@@ -44,67 +45,6 @@ def open_browser():
     webbrowser.open(URL)
 
 
-def stop_app():
-    """Kill any lingering chromedriver/chrome processes then exit."""
-    import signal
-    import subprocess
-    try:
-        if sys.platform == "win32":
-            subprocess.call(["taskkill", "/F", "/IM", "chromedriver.exe"], stderr=subprocess.DEVNULL)
-            subprocess.call(["taskkill", "/F", "/IM", "chrome.exe"], stderr=subprocess.DEVNULL)
-        else:
-            subprocess.call(["pkill", "-f", "chromedriver"], stderr=subprocess.DEVNULL)
-            subprocess.call(["pkill", "-f", "Google Chrome for Testing"], stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-    os._exit(0)
-
-
-def show_stop_window():
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.title("Site to DOCX")
-        root.resizable(False, False)
-        root.geometry("300x120")
-
-        # Keep window on top so it's easy to find
-        root.attributes("-topmost", True)
-
-        label = tk.Label(
-            root,
-            text=f"Site to DOCX is running.\n{URL}",
-            pady=16,
-            font=("Helvetica", 12),
-        )
-        label.pack()
-
-        btn = tk.Button(
-            root,
-            text="Stop App",
-            command=lambda: stop_app(),
-            bg="#e53e3e",
-            fg="white",
-            font=("Helvetica", 12, "bold"),
-            padx=20,
-            pady=6,
-            relief="flat",
-            cursor="hand2",
-        )
-        btn.pack()
-
-        root.protocol("WM_DELETE_WINDOW", lambda: stop_app())
-        root.mainloop()
-    except Exception:
-        # tkinter unavailable — fall back to blocking loop
-        print(f"App is running at {URL}. Press Ctrl+C to stop.")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            sys.exit(0)
-
-
 if __name__ == "__main__":
     print(f"Starting Site to DOCX at {URL} ...")
 
@@ -114,4 +54,8 @@ if __name__ == "__main__":
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
 
-    show_stop_window()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        sys.exit(0)

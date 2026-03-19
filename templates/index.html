@@ -157,6 +157,25 @@
       font-size: 0.88rem;
     }
 
+    .stop-btn {
+      margin-top: 0.75rem;
+      width: 100%;
+      padding: 0.65rem;
+      background: #dc2626;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      display: none;
+    }
+
+    .stop-btn:hover {
+      background: #b91c1c;
+    }
+
     .note {
       margin-top: 1.5rem;
       font-size: 0.78rem;
@@ -184,6 +203,7 @@
         <span class="spinner" id="spinner"></span>
         <span id="btn-label">Start Scraping</span>
       </button>
+      <button type="button" class="stop-btn" id="stop-btn">Stop</button>
     </form>
 
     <div id="error-area"></div>
@@ -205,6 +225,7 @@
   <script>
     const form = document.getElementById('scrape-form');
     const submitBtn = document.getElementById('submit-btn');
+    const stopBtn = document.getElementById('stop-btn');
     const spinner = document.getElementById('spinner');
     const btnLabel = document.getElementById('btn-label');
     const statusArea = document.getElementById('status-area');
@@ -220,7 +241,13 @@
       submitBtn.disabled = loading;
       spinner.style.display = loading ? 'block' : 'none';
       btnLabel.textContent = loading ? 'Scraping...' : 'Start Scraping';
+      stopBtn.style.display = loading ? 'block' : 'none';
     }
+
+    stopBtn.addEventListener('click', function() {
+      clearInterval(pollInterval);
+      fetch('/stop', { method: 'POST' }).catch(() => {});
+    });
 
     function showError(msg) {
       errorArea.textContent = msg;

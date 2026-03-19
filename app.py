@@ -106,6 +106,21 @@ def status(job_id):
         })
 
 
+@app.route("/stop", methods=["POST"])
+def stop():
+    import subprocess, sys, os
+    try:
+        if sys.platform == "win32":
+            subprocess.call(["taskkill", "/F", "/IM", "chromedriver.exe"], stderr=subprocess.DEVNULL)
+            subprocess.call(["taskkill", "/F", "/IM", "chrome.exe"], stderr=subprocess.DEVNULL)
+        else:
+            subprocess.call(["pkill", "-f", "chromedriver"], stderr=subprocess.DEVNULL)
+            subprocess.call(["pkill", "-f", "Google Chrome for Testing"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    os._exit(0)
+
+
 @app.route("/download/<job_id>")
 def download(job_id):
     with jobs_lock:
