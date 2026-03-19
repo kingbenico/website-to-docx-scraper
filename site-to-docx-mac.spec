@@ -9,6 +9,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('templates', 'templates'),
+        ('static', 'static'),
     ],
     hiddenimports=[
         # Flask internals

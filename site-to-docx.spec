@@ -7,9 +7,10 @@ a = Analysis(
     ['launcher.py'],
     pathex=[],
     binaries=[],
-    # Bundle the templates folder so Flask can find index.html
+    # Bundle the templates and static folders
     datas=[
         ('templates', 'templates'),
+        ('static', 'static'),
     ],
     hiddenimports=[
         # Flask internals
