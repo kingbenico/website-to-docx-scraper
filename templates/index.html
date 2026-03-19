@@ -246,6 +246,9 @@
 
     stopBtn.addEventListener('click', function() {
       clearInterval(pollInterval);
+      logBox.textContent += '\n Stopped by user.\n';
+      logBox.scrollTop = logBox.scrollHeight;
+      setLoading(false);
       fetch('/stop', { method: 'POST' }).catch(() => {});
     });
 
