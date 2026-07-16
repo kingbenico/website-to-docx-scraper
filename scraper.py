@@ -72,7 +72,15 @@ def make_driver():
 # SITEMAP
 # ==============================
 
-def find_sitemap_urls(base_url):
+def find_sitemap_urls(base_url, driver=None, log=print):
+    """
+    Look for a sitemap at common paths. Tries a plain HTTP request first (fast,
+    no browser needed). If that finds nothing — e.g. a bot-protection layer
+    like Cloudflare is blocking the hosting provider's IP with a 403/challenge
+    page, which plain `requests` can't get past — and a Selenium `driver` was
+    passed in, retry each candidate through the real browser instead, since a
+    genuine browser TLS/JS fingerprint is far less likely to be blocked.
+    """
     candidates = [
         "/sitemap.xml",
         "/sitemap_index.xml",
@@ -89,28 +97,57 @@ def find_sitemap_urls(base_url):
                 txt = r.text.lower()
                 if "<urlset" in txt or "<sitemapindex" in txt:
                     found_urls.append(url)
-        except Exception:
-            pass
+                else:
+                    log(f"  [sitemap] {url} -> HTTP 200 but not a sitemap (likely a challenge/error page)")
+            else:
+                log(f"  [sitemap] {url} -> HTTP {r.status_code}")
+        except Exception as e:
+            log(f"  [sitemap] {url} -> request failed: {e}")
+
+    if found_urls:
+        return list(set(found_urls))
+
+    if driver is not None:
+        log("  [sitemap] Plain HTTP requests found nothing — retrying via browser...")
+        for path in candidates:
+            url = urljoin(base_url, path)
+            try:
+                driver.get(url)
+                txt = driver.page_source.lower()
+                if "<urlset" in txt or "<sitemapindex" in txt:
+                    found_urls.append(url)
+                    log(f"  [sitemap] {url} -> found via browser")
+            except Exception as e:
+                log(f"  [sitemap] {url} -> browser fetch failed: {e}")
 
     return list(set(found_urls))
 
 
-def parse_sitemap(url, collected):
+def parse_sitemap(url, collected, driver=None, log=print):
     try:
         r = requests.get(url, timeout=30, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "xml")
+        txt = r.text
+        if r.status_code != 200 or ("<urlset" not in txt.lower() and "<sitemapindex" not in txt.lower()):
+            if driver is not None:
+                log(f"  [sitemap] {url} -> HTTP {r.status_code} via requests, retrying via browser...")
+                driver.get(url)
+                txt = driver.page_source
+            else:
+                log(f"  [sitemap] {url} -> HTTP {r.status_code}, unusable and no browser fallback available")
+                return
+        soup = BeautifulSoup(txt, "xml")
 
         sitemap_tags = soup.find_all("sitemap")
         if sitemap_tags:
             for sm in sitemap_tags:
-                parse_sitemap(sm.loc.text.strip(), collected)
+                parse_sitemap(sm.loc.text.strip(), collected, driver=driver, log=log)
             return
 
         for url_tag in soup.find_all("url"):
             collected.add(url_tag.loc.text.strip())
 
     except Exception as e:
-        print(f"Sitemap parse error: {e}")
+        log(f"Sitemap parse error: {e}")
 
 # ==============================
 # PAGE INTERACTION
@@ -820,14 +857,14 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
             log(f"Single-page mode: scraping only {single_url}")
         else:
             log("Discovering sitemaps...")
-            sitemap_urls = find_sitemap_urls(base_url)
+            sitemap_urls = find_sitemap_urls(base_url, driver=driver, log=log)
             if not sitemap_urls:
                 driver.quit()
                 raise ValueError("No sitemap found at the provided URL.")
 
             all_urls = set()
             for sm in sitemap_urls:
-                parse_sitemap(sm, all_urls)
+                parse_sitemap(sm, all_urls, driver=driver, log=log)
 
         log(f"Found {len(all_urls)} URLs to scrape.")
 
