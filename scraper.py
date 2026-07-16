@@ -109,18 +109,49 @@ def find_sitemap_urls(base_url, driver=None, log=print):
 
     if driver is not None:
         log("  [sitemap] Plain HTTP requests found nothing — retrying via browser...")
+        try:
+            # An in-page XHR is subject to same-origin policy and returns nothing
+            # if the browser hasn't loaded a page on this origin yet.
+            driver.get(base_url)
+        except Exception as e:
+            log(f"  [sitemap] Could not load {base_url} in browser: {e}")
         for path in candidates:
             url = urljoin(base_url, path)
             try:
-                driver.get(url)
-                txt = driver.page_source.lower()
-                if "<urlset" in txt or "<sitemapindex" in txt:
+                txt = _browser_fetch_text(driver, url)
+                if txt and ("<urlset" in txt.lower() or "<sitemapindex" in txt.lower()):
                     found_urls.append(url)
                     log(f"  [sitemap] {url} -> found via browser")
+                else:
+                    log(f"  [sitemap] {url} -> browser fetch returned no sitemap content")
             except Exception as e:
                 log(f"  [sitemap] {url} -> browser fetch failed: {e}")
 
     return list(set(found_urls))
+
+
+def _browser_fetch_text(driver, url):
+    """
+    Fetch a URL's raw response body using an in-page XMLHttpRequest, rather
+    than driver.get(). Many WordPress sitemaps declare an xml-stylesheet
+    (e.g. Rank Math's main-sitemap.xsl) that browsers apply when navigating
+    directly to the URL, turning driver.page_source into XSLT-rendered HTML
+    with no literal <urlset>/<sitemapindex> tags. A same-origin XHR returns
+    the actual raw XML instead, while still riding on the browser's TLS/JS
+    fingerprint to get past bot-protection that blocks plain `requests` calls.
+    """
+    return driver.execute_async_script(
+        """
+        var url = arguments[0];
+        var callback = arguments[arguments.length - 1];
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url);
+        xhr.onload = function() { callback(xhr.responseText); };
+        xhr.onerror = function() { callback(''); };
+        xhr.send();
+        """,
+        url,
+    )
 
 
 def parse_sitemap(url, collected, driver=None, log=print):
@@ -130,8 +161,7 @@ def parse_sitemap(url, collected, driver=None, log=print):
         if r.status_code != 200 or ("<urlset" not in txt.lower() and "<sitemapindex" not in txt.lower()):
             if driver is not None:
                 log(f"  [sitemap] {url} -> HTTP {r.status_code} via requests, retrying via browser...")
-                driver.get(url)
-                txt = driver.page_source
+                txt = _browser_fetch_text(driver, url)
             else:
                 log(f"  [sitemap] {url} -> HTTP {r.status_code}, unusable and no browser fallback available")
                 return
