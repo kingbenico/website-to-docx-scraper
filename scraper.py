@@ -6,9 +6,10 @@ Driver is created inside run_scrape() — no module-level side effects.
 
 import json
 import os
+import re
 import time
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -320,16 +321,185 @@ def extract_elementor_faq(soup):
     return faq_blocks
 
 # ==============================
+# BUSINESS INFO EXTRACTOR
+# ==============================
+
+PHONE_RE = re.compile(
+    r"(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"
+)
+EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+)
+ADDRESS_HINT_RE = re.compile(
+    r"\d{1,6}\s+[A-Za-z0-9.\s]{2,60}\b(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Suite|Ste|Highway|Hwy)\b[.,]?\s*[A-Za-z\s]{0,40},?\s*[A-Z]{2}\s*\d{5}(-\d{4})?",
+    re.IGNORECASE,
+)
+
+EMAIL_EXCLUDE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+
+
+def _extract_phones(soup, info):
+    for a in soup.find_all("a", href=True):
+        href = unquote(a["href"].strip())
+        if href.lower().startswith("tel:"):
+            phone = href[4:].strip()
+            if phone:
+                info["phones"].add(phone)
+
+    body = soup.body if soup.body else soup
+    text = body.get_text(" ", strip=True)
+    for m in PHONE_RE.finditer(text):
+        candidate = m.group(0).strip()
+        digits = re.sub(r"\D", "", candidate)
+        if len(digits) in (10, 11):
+            info["phones"].add(candidate)
+
+
+def extract_business_info(soup, url, info, skip_phones=False):
+    """
+    Scan a page's soup for business contact details (phone, email, address)
+    and merge findings into the shared `info` dict. Also checks schema.org
+    LocalBusiness/Organization JSON-LD, which WordPress sites commonly include.
+
+    skip_phones: when True, phone extraction is skipped here — the caller is
+    responsible for extracting phones separately from raw (non-JS) HTML, to
+    avoid picking up JS-swapped call-tracking numbers.
+    """
+
+    # --- JSON-LD structured data (most reliable source) ---
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            obj_type = obj.get("@type", "")
+            if isinstance(obj_type, list):
+                is_business = any(
+                    t in ("LocalBusiness", "Organization", "Corporation")
+                    or "Business" in str(t)
+                    for t in obj_type
+                )
+            else:
+                is_business = (
+                    obj_type in ("LocalBusiness", "Organization", "Corporation")
+                    or "Business" in str(obj_type)
+                )
+            if not is_business:
+                continue
+
+            if not info["name"] and obj.get("name"):
+                info["name"] = obj["name"].strip()
+
+            if not skip_phones:
+                phone = obj.get("telephone")
+                if phone:
+                    info["phones"].add(phone.strip())
+
+            email = obj.get("email")
+            if email:
+                info["emails"].add(email.strip())
+
+            addr = obj.get("address")
+            if isinstance(addr, dict):
+                parts = [
+                    addr.get("streetAddress", ""),
+                    addr.get("addressLocality", ""),
+                    addr.get("addressRegion", ""),
+                    addr.get("postalCode", ""),
+                ]
+                full_addr = ", ".join(p.strip() for p in parts if p and p.strip())
+                if full_addr:
+                    info["addresses"].add(full_addr)
+            elif isinstance(addr, str) and addr.strip():
+                info["addresses"].add(addr.strip())
+
+    # --- tel: link / plain-text phone scan (skipped when using raw-HTML mode) ---
+    if not skip_phones:
+        _extract_phones(soup, info)
+
+    # --- mailto: links ---
+    for a in soup.find_all("a", href=True):
+        href = unquote(a["href"].strip())
+        if href.lower().startswith("mailto:"):
+            email = href[7:].split("?")[0].strip()
+            if email:
+                info["emails"].add(email)
+
+    # --- Plain-text regex scan of visible body text (footer/header often hold this) ---
+    body = soup.body if soup.body else soup
+    text = body.get_text(" ", strip=True)
+
+    for m in EMAIL_RE.finditer(text):
+        candidate = m.group(0).strip().rstrip(".,;")
+        if not candidate.lower().endswith(EMAIL_EXCLUDE_EXTENSIONS):
+            info["emails"].add(candidate)
+
+    for m in ADDRESS_HINT_RE.finditer(text):
+        info["addresses"].add(m.group(0).strip())
+
+    # --- Google Maps embed fallback ---
+    # Embedded Maps widgets (<gmp-place-details-compact>, older iframe embeds) render the
+    # address inside a closed shadow root, which is invisible to page_source / DOM scripting.
+    # No address text can be recovered from that widget without calling the Places API, so
+    # as a fallback we capture the "Get directions" / map link instead, giving the user a
+    # clickable reference to the location even when the plain-text address isn't found.
+    if not info["addresses"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if "google.com/maps" in href.lower() or "maps.google.com" in href.lower():
+                info["map_links"].add(href)
+
+
+def extract_static_phones(url, info):
+    """
+    Fetch a page's raw HTML via plain HTTP (no browser, no JavaScript at all)
+    and extract phone numbers from it. Used when the user wants the original
+    static phone number rather than one swapped in by a call-tracking script
+    (e.g. CallRail, CallTrackingMetrics) that only runs after JS executes.
+    """
+    try:
+        r = requests.get(url, timeout=20, headers=HEADERS)
+        if r.status_code != 200:
+            return
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return
+
+    _extract_phones(soup, info)
+
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            phone = obj.get("telephone")
+            if phone:
+                info["phones"].add(phone.strip())
+
+
+# ==============================
 # CLEAN TEXT
 # ==============================
 
-def clean_text_blocks(soup):
-
-    for tag in soup(["script","style","noscript","header","footer","nav","svg"]):
-        tag.decompose()
-
-    for tag in soup(["input","textarea","select","option","label"]):
-        tag.decompose()
+def extract_text_blocks(root, strip_forms=True):
+    """
+    Walk a subtree (page body, or a standalone header/footer fragment) and
+    extract the same heading/paragraph/button/accordion structure that
+    clean_text_blocks() produces for the main page body. Shared so header
+    and footer extraction stay visually consistent with page content.
+    """
+    if strip_forms:
+        for tag in root(["input", "textarea", "select", "option", "label"]):
+            tag.decompose()
 
     text_items = []
     seen = set()
@@ -344,7 +514,6 @@ def clean_text_blocks(soup):
                 return parent
         return None
 
-    root = soup.body if soup.body else soup
     for el in root.find_all(True, recursive=True):
 
         if _has_class(el, "elementor-accordion-item") or _has_class(el, "e-n-accordion-item"):
@@ -417,6 +586,17 @@ def clean_text_blocks(soup):
 
         text_items.append((el.name, txt))
 
+    return text_items
+
+
+def clean_text_blocks(soup):
+
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "svg"]):
+        tag.decompose()
+
+    root = soup.body if soup.body else soup
+    text_items = extract_text_blocks(root)
+
     for script in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
@@ -428,8 +608,7 @@ def clean_text_blocks(soup):
                         q = entity.get("name", "")
                         a_obj = entity.get("acceptedAnswer", {})
                         a = a_obj.get("text", "") if isinstance(a_obj, dict) else ""
-                        if q and a and q.lower() not in seen:
-                            seen.add(q.lower())
+                        if q and a and q.lower() not in {i[1].lower() for i in text_items}:
                             a_clean = BeautifulSoup(a, "lxml").get_text(" ", strip=True)
                             text_items.append(("h3", q))
                             text_items.append(("p", a_clean))
@@ -442,7 +621,8 @@ def clean_text_blocks(soup):
 # SCRAPE PAGE
 # ==============================
 
-def scrape_page(driver, url, wait_time, max_retries):
+def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_phones=False,
+                 include_header=False, include_footer=False):
     for _ in range(max_retries):
         try:
             driver.get(url)
@@ -456,9 +636,30 @@ def scrape_page(driver, url, wait_time, max_retries):
 
             soup = BeautifulSoup(driver.page_source, "lxml")
             title = soup.title.string.strip() if soup.title else url
+
+            # Business info (phone/email/address) often lives in header/footer/nav,
+            # which clean_text_blocks() strips — extract it first, before that mutation.
+            if business_info is not None:
+                extract_business_info(soup, url, business_info, skip_phones=static_phones)
+                if static_phones:
+                    # Fetch raw (non-JS) HTML so any call-tracking script that swaps
+                    # in a dynamic number after page load can't affect the result.
+                    extract_static_phones(url, business_info)
+
+            # Header/footer content, if requested — must run before clean_text_blocks()
+            # decomposes <header>/<footer> tags out of the soup.
+            header_blocks = []
+            footer_blocks = []
+            if include_header:
+                for tag in soup.find_all("header"):
+                    header_blocks.extend(extract_text_blocks(tag, strip_forms=False))
+            if include_footer:
+                for tag in soup.find_all("footer"):
+                    footer_blocks.extend(extract_text_blocks(tag, strip_forms=False))
+
             content_blocks = clean_text_blocks(soup)
 
-            return title, content_blocks, driver
+            return title, content_blocks, driver, header_blocks, footer_blocks
 
         except Exception as e:
             print(f"Retry for {url}: {e}")
@@ -473,13 +674,13 @@ def scrape_page(driver, url, wait_time, max_retries):
             else:
                 time.sleep(2)
 
-    return url, [], driver
+    return url, [], driver, [], []
 
 # ==============================
 # DOCX BUILDER
 # ==============================
 
-def build_docx(company_name, pages_data, output_path):
+def build_docx(company_name, pages_data, output_path, business_info=None):
 
     doc = Document()
 
@@ -489,6 +690,42 @@ def build_docx(company_name, pages_data, output_path):
     run.font.size = Pt(20)
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph("")
+
+    # --- Business Summary (before the table of contents) ---
+    if business_info is not None:
+        doc.add_heading("Business Summary", level=1)
+
+        if business_info["name"]:
+            p = doc.add_paragraph()
+            p.add_run("Business Name: ").bold = True
+            p.add_run(business_info["name"])
+
+        if business_info["phones"]:
+            p = doc.add_paragraph()
+            p.add_run("Phone: ").bold = True
+            p.add_run(", ".join(sorted(business_info["phones"])))
+
+        if business_info["emails"]:
+            p = doc.add_paragraph()
+            p.add_run("Email: ").bold = True
+            p.add_run(", ".join(sorted(business_info["emails"])))
+
+        if business_info["addresses"]:
+            p = doc.add_paragraph()
+            p.add_run("Address: ").bold = True
+            p.add_run(" | ".join(sorted(business_info["addresses"])))
+        elif business_info.get("map_links"):
+            p = doc.add_paragraph()
+            p.add_run("Map Link: ").bold = True
+            p.add_run(" | ".join(sorted(business_info["map_links"])))
+
+        if not any(
+            business_info.get(k)
+            for k in ("name", "phones", "emails", "addresses", "map_links")
+        ):
+            doc.add_paragraph("No business contact details were found on the site.")
+
+        doc.add_page_break()
 
     table = doc.add_table(rows=1, cols=2)
     table.rows[0].cells[0].text = "Page Title"
@@ -506,41 +743,68 @@ def build_docx(company_name, pages_data, output_path):
         doc.add_paragraph(f"URL: {page['url']}")
         doc.add_paragraph("")
 
-        for item in page["content"]:
-            tag, text = item[0], item[1]
-            href = item[2] if len(item) > 2 else ""
+        if page.get("header"):
+            doc.add_heading("Header", level=2)
+            _add_content_blocks(doc, page["header"])
+            doc.add_paragraph("")
 
-            if tag.startswith("h"):
-                level = min(int(tag[1]), 4)
-                doc.add_heading(text, level=level)
-                doc.add_paragraph("")
-            elif tag == "button":
-                para = doc.add_paragraph()
-                run = para.add_run(f"[ {text} ]")
-                run.bold = True
-                if href:
-                    link_para = doc.add_paragraph()
-                    link_run = link_para.add_run(href)
-                    link_run.italic = True
-                    link_run.font.size = Pt(9)
-            else:
-                para = doc.add_paragraph(text)
-                if any(p in text.lower() for p in CTA_PHRASES):
-                    para.runs[0].bold = True
+        if page.get("footer"):
+            doc.add_heading("Footer", level=2)
+            _add_content_blocks(doc, page["footer"])
+            doc.add_paragraph("")
+
+        _add_content_blocks(doc, page["content"])
 
         doc.add_page_break()
 
     doc.save(output_path)
 
+
+def _add_content_blocks(doc, blocks):
+    for item in blocks:
+        tag, text = item[0], item[1]
+        href = item[2] if len(item) > 2 else ""
+
+        if tag.startswith("h"):
+            level = min(int(tag[1]), 4)
+            doc.add_heading(text, level=level)
+            doc.add_paragraph("")
+        elif tag == "button":
+            para = doc.add_paragraph()
+            run = para.add_run(f"[ {text} ]")
+            run.bold = True
+            if href:
+                link_para = doc.add_paragraph()
+                link_run = link_para.add_run(href)
+                link_run.italic = True
+                link_run.font.size = Pt(9)
+        else:
+            para = doc.add_paragraph(text)
+            if any(p in text.lower() for p in CTA_PHRASES):
+                para.runs[0].bold = True
+
 # ==============================
 # PUBLIC ENTRYPOINT
 # ==============================
 
-def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None):
+def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, static_phones=False,
+               single_url=None, include_header=False, include_footer=False):
     """
     Run the full scrape pipeline for base_url.
     Returns the absolute path to the generated .docx file.
     progress_callback(msg: str) is called with status updates if provided.
+
+    static_phones: when True, phone numbers are read from each page's raw
+    (non-JS) HTML instead of the Selenium-rendered DOM, so call-tracking
+    scripts that swap in a dynamic number after page load are bypassed.
+
+    single_url: when provided, skips sitemap discovery/crawling entirely and
+    scrapes only this one URL. Useful for quickly testing extraction changes
+    (e.g. static_phones) against one page instead of the whole site.
+
+    include_header / include_footer: when True, each page's <header>/<footer>
+    content is extracted separately (normally stripped as boilerplate) and
+    rendered under a "Header"/"Footer" heading in the docx.
     """
     def log(msg):
         print(msg)
@@ -551,15 +815,19 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None):
     driver = make_driver()
 
     try:
-        log("Discovering sitemaps...")
-        sitemap_urls = find_sitemap_urls(base_url)
-        if not sitemap_urls:
-            driver.quit()
-            raise ValueError("No sitemap found at the provided URL.")
+        if single_url:
+            all_urls = {single_url}
+            log(f"Single-page mode: scraping only {single_url}")
+        else:
+            log("Discovering sitemaps...")
+            sitemap_urls = find_sitemap_urls(base_url)
+            if not sitemap_urls:
+                driver.quit()
+                raise ValueError("No sitemap found at the provided URL.")
 
-        all_urls = set()
-        for sm in sitemap_urls:
-            parse_sitemap(sm, all_urls)
+            all_urls = set()
+            for sm in sitemap_urls:
+                parse_sitemap(sm, all_urls)
 
         log(f"Found {len(all_urls)} URLs to scrape.")
 
@@ -567,14 +835,28 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None):
         low_priority_pages = []
         all_urls_list = sorted(all_urls)
 
+        business_info = {
+            "name": "",
+            "phones": set(),
+            "emails": set(),
+            "addresses": set(),
+            "map_links": set(),
+        }
+
         for i, url in enumerate(all_urls_list, 1):
             log(f"[{i}/{len(all_urls_list)}] Scraping {url}")
-            title, content, driver = scrape_page(driver, url, wait_time, max_retries)
+            title, content, driver, header_blocks, footer_blocks = scrape_page(
+                driver, url, wait_time, max_retries,
+                business_info=business_info, static_phones=static_phones,
+                include_header=include_header, include_footer=include_footer,
+            )
 
             page_obj = {
                 "url": url,
                 "title": title,
                 "content": content,
+                "header": header_blocks,
+                "footer": footer_blocks,
             }
 
             if any(p in url.lower() for p in LOW_PRIORITY_PATTERNS):
@@ -589,7 +871,7 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None):
         output_path = f"/tmp/{safe_name}_site_content.docx"
 
         log("Building DOCX...")
-        build_docx(company_name, pages_data, output_path)
+        build_docx(company_name, pages_data, output_path, business_info)
 
         log(f"Done! Saved to {output_path}")
         return output_path

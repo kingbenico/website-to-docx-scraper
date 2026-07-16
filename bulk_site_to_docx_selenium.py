@@ -5,9 +5,10 @@ Elementor + Non-Elementor Safe
 """
 
 import json
+import re
 import time
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -344,6 +345,125 @@ def extract_elementor_faq(soup):
     return faq_blocks
 
 # ==============================
+# BUSINESS INFO EXTRACTOR
+# ==============================
+
+PHONE_RE = re.compile(
+    r"(\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b"
+)
+EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+)
+ADDRESS_HINT_RE = re.compile(
+    r"\d{1,6}\s+[A-Za-z0-9.\s]{2,60}\b(Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Drive|Dr|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Suite|Ste|Highway|Hwy)\b[.,]?\s*[A-Za-z\s]{0,40},?\s*[A-Z]{2}\s*\d{5}(-\d{4})?",
+    re.IGNORECASE,
+)
+
+EMAIL_EXCLUDE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+
+
+def extract_business_info(soup, url, info):
+    """
+    Scan a page's soup for business contact details (phone, email, address)
+    and merge findings into the shared `info` dict. Also checks schema.org
+    LocalBusiness/Organization JSON-LD, which WordPress sites commonly include.
+    """
+
+    # --- JSON-LD structured data (most reliable source) ---
+    for script in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+
+        candidates = data if isinstance(data, list) else [data]
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            obj_type = obj.get("@type", "")
+            if isinstance(obj_type, list):
+                is_business = any(
+                    t in ("LocalBusiness", "Organization", "Corporation")
+                    or "Business" in str(t)
+                    for t in obj_type
+                )
+            else:
+                is_business = (
+                    obj_type in ("LocalBusiness", "Organization", "Corporation")
+                    or "Business" in str(obj_type)
+                )
+            if not is_business:
+                continue
+
+            if not info["name"] and obj.get("name"):
+                info["name"] = obj["name"].strip()
+
+            phone = obj.get("telephone")
+            if phone:
+                info["phones"].add(phone.strip())
+
+            email = obj.get("email")
+            if email:
+                info["emails"].add(email.strip())
+
+            addr = obj.get("address")
+            if isinstance(addr, dict):
+                parts = [
+                    addr.get("streetAddress", ""),
+                    addr.get("addressLocality", ""),
+                    addr.get("addressRegion", ""),
+                    addr.get("postalCode", ""),
+                ]
+                full_addr = ", ".join(p.strip() for p in parts if p and p.strip())
+                if full_addr:
+                    info["addresses"].add(full_addr)
+            elif isinstance(addr, str) and addr.strip():
+                info["addresses"].add(addr.strip())
+
+    # --- tel: / mailto: links (high precision, low false-positive rate) ---
+    for a in soup.find_all("a", href=True):
+        href = unquote(a["href"].strip())
+        if href.lower().startswith("tel:"):
+            phone = href[4:].strip()
+            if phone:
+                info["phones"].add(phone)
+        elif href.lower().startswith("mailto:"):
+            email = href[7:].split("?")[0].strip()
+            if email:
+                info["emails"].add(email)
+
+    # --- Plain-text regex scan of visible body text (footer/header often hold this) ---
+    body = soup.body if soup.body else soup
+    text = body.get_text(" ", strip=True)
+
+    for m in PHONE_RE.finditer(text):
+        candidate = m.group(0).strip()
+        digits = re.sub(r"\D", "", candidate)
+        if len(digits) in (10, 11):
+            info["phones"].add(candidate)
+
+    for m in EMAIL_RE.finditer(text):
+        candidate = m.group(0).strip().rstrip(".,;")
+        if not candidate.lower().endswith(EMAIL_EXCLUDE_EXTENSIONS):
+            info["emails"].add(candidate)
+
+    for m in ADDRESS_HINT_RE.finditer(text):
+        info["addresses"].add(m.group(0).strip())
+
+    # --- Google Maps embed fallback ---
+    # Embedded Maps widgets (<gmp-place-details-compact>, older iframe embeds) render the
+    # address inside a closed shadow root, which is invisible to page_source / DOM scripting.
+    # No address text can be recovered from that widget without calling the Places API, so
+    # as a fallback we capture the "Get directions" / map link instead, giving the user a
+    # clickable reference to the location even when the plain-text address isn't found.
+    if not info["addresses"]:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if "google.com/maps" in href.lower() or "maps.google.com" in href.lower():
+                info["map_links"].add(href)
+
+
+# ==============================
 # CLEAN TEXT
 # ==============================
 
@@ -490,7 +610,7 @@ def clean_text_blocks(soup):
 # SCRAPE PAGE
 # ==============================
 
-def scrape_page(url):
+def scrape_page(url, business_info=None):
     global driver
     for _ in range(MAX_RETRIES):
         try:
@@ -505,6 +625,12 @@ def scrape_page(url):
 
             soup = BeautifulSoup(driver.page_source, "lxml")
             title = soup.title.string.strip() if soup.title else url
+
+            # Business info (phone/email/address) often lives in header/footer/nav,
+            # which clean_text_blocks() strips — extract it first, before that mutation.
+            if business_info is not None:
+                extract_business_info(soup, url, business_info)
+
             content_blocks = clean_text_blocks(soup)
 
             return title, content_blocks
@@ -529,7 +655,7 @@ def scrape_page(url):
 # DOCX BUILDER
 # ==============================
 
-def build_docx(company_name, pages_data, output_path):
+def build_docx(company_name, pages_data, output_path, business_info=None):
 
     doc = Document()
 
@@ -539,6 +665,44 @@ def build_docx(company_name, pages_data, output_path):
     run.font.size = Pt(20)
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     doc.add_paragraph("")
+
+    # --- Business Summary (before the table of contents) ---
+    if business_info is not None:
+        doc.add_heading("Business Summary", level=1)
+
+        if business_info["name"]:
+            p = doc.add_paragraph()
+            p.add_run("Business Name: ").bold = True
+            p.add_run(business_info["name"])
+
+        if business_info["phones"]:
+            p = doc.add_paragraph()
+            p.add_run("Phone: ").bold = True
+            p.add_run(", ".join(sorted(business_info["phones"])))
+
+        if business_info["emails"]:
+            p = doc.add_paragraph()
+            p.add_run("Email: ").bold = True
+            p.add_run(", ".join(sorted(business_info["emails"])))
+
+        if business_info["addresses"]:
+            p = doc.add_paragraph()
+            p.add_run("Address: ").bold = True
+            p.add_run(" | ".join(sorted(business_info["addresses"])))
+        elif business_info.get("map_links"):
+            # No plain-text address found (e.g. it's rendered inside a closed shadow root
+            # by an embedded Google Maps widget) — fall back to a clickable map link.
+            p = doc.add_paragraph()
+            p.add_run("Map Link: ").bold = True
+            p.add_run(" | ".join(sorted(business_info["map_links"])))
+
+        if not any(
+            business_info.get(k)
+            for k in ("name", "phones", "emails", "addresses", "map_links")
+        ):
+            doc.add_paragraph("No business contact details were found on the site.")
+
+        doc.add_page_break()
 
     table = doc.add_table(rows=1, cols=2)
     table.rows[0].cells[0].text = "Page Title"
@@ -602,10 +766,18 @@ def main():
     normal_pages = []
     low_priority_pages = []
 
+    business_info = {
+        "name": "",
+        "phones": set(),
+        "emails": set(),
+        "addresses": set(),
+        "map_links": set(),
+    }
+
     for i, url in enumerate(sorted(all_urls), 1):
         print(f"[{i}/{len(all_urls)}] Scraping {url}")
 
-        title, content = scrape_page(url)
+        title, content = scrape_page(url, business_info)
 
         page_obj = {
             "url": url,
@@ -625,7 +797,7 @@ def main():
     output_path = f"{safe_name}_site_content.docx"
 
     print("Building DOCX...")
-    build_docx(company_name, pages_data, output_path)
+    build_docx(company_name, pages_data, output_path, business_info)
 
     driver.quit()
     print(f"Done! Saved to {output_path}")

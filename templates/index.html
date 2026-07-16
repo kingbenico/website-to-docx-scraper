@@ -61,6 +61,38 @@
       border-color: #4f46e5;
     }
 
+    .checkbox-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.6rem;
+      margin-top: 1.1rem;
+    }
+
+    .checkbox-row input[type="checkbox"] {
+      margin-top: 0.15rem;
+      width: 16px;
+      height: 16px;
+      accent-color: #4f46e5;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .checkbox-row label {
+      margin-bottom: 0;
+      font-weight: 600;
+      color: #333;
+      cursor: pointer;
+    }
+
+    .checkbox-row .checkbox-hint {
+      display: block;
+      margin-top: 0.15rem;
+      font-size: 0.78rem;
+      font-weight: 400;
+      color: #888;
+      line-height: 1.4;
+    }
+
     button[type="submit"] {
       margin-top: 1rem;
       width: 100%;
@@ -182,6 +214,58 @@
       color: #999;
       line-height: 1.5;
     }
+
+    .advanced {
+      margin-top: 1.1rem;
+    }
+
+    .advanced > summary {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #4f46e5;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
+    }
+
+    .advanced > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .advanced > summary::before {
+      content: "▸ ";
+      display: inline-block;
+      transition: transform 0.15s;
+    }
+
+    .advanced[open] > summary::before {
+      transform: rotate(90deg);
+    }
+
+    .advanced-body {
+      margin-top: 0.75rem;
+      padding: 0.9rem;
+      background: #f8f8fb;
+      border: 1px solid #e5e5eb;
+      border-radius: 8px;
+    }
+
+    .advanced-body label {
+      font-weight: 600;
+    }
+
+    .advanced-body .checkbox-hint {
+      display: block;
+      margin-top: 0.3rem;
+      font-size: 0.78rem;
+      font-weight: 400;
+      color: #888;
+      line-height: 1.4;
+    }
+
+    .advanced-body input[type="url"] {
+      margin-top: 0.4rem;
+    }
   </style>
 </head>
 <body>
@@ -199,6 +283,53 @@
         placeholder="https://example.com/"
         required
       />
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="static-phones-input" name="static_phones" />
+        <label for="static-phones-input">
+          Use static phone numbers only
+          <span class="checkbox-hint">
+            Skips JavaScript-based number swapping (e.g. call-tracking scripts) and captures the original number shown in the page's raw HTML instead.
+          </span>
+        </label>
+      </div>
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="include-header-input" name="include_header" />
+        <label for="include-header-input">
+          Include header content
+          <span class="checkbox-hint">
+            Scans each page's &lt;header&gt; (normally skipped) and adds it to the docx under a "Header" heading.
+          </span>
+        </label>
+      </div>
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="include-footer-input" name="include_footer" />
+        <label for="include-footer-input">
+          Include footer content
+          <span class="checkbox-hint">
+            Scans each page's &lt;footer&gt; (normally skipped) and adds it to the docx under a "Footer" heading.
+          </span>
+        </label>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced: test a single page</summary>
+        <div class="advanced-body">
+          <label for="single-url-input">Page URL (optional)</label>
+          <input
+            type="url"
+            id="single-url-input"
+            name="single_url"
+            placeholder="https://example.com/contact/"
+          />
+          <span class="checkbox-hint">
+            If set, only this exact page is scraped (the sitemap crawl is skipped) — handy for quickly checking a setting like "static phone numbers" against one page before running the full site.
+          </span>
+        </div>
+      </details>
+
       <button type="submit" id="submit-btn">
         <span class="spinner" id="spinner"></span>
         <span id="btn-label">Start Scraping</span>

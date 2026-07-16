@@ -31,7 +31,8 @@ _scrape_semaphore = threading.Semaphore(1)
 # BACKGROUND WORKER
 # ==============================
 
-def _run_job(job_id: str, url: str):
+def _run_job(job_id: str, url: str, static_phones: bool, single_url: Optional[str],
+             include_header: bool, include_footer: bool):
     def log(msg):
         with jobs_lock:
             jobs[job_id].log.append(msg)
@@ -43,7 +44,11 @@ def _run_job(job_id: str, url: str):
 
         try:
             from scraper import run_scrape
-            output_path = run_scrape(url, progress_callback=log)
+            output_path = run_scrape(
+                url, progress_callback=log,
+                static_phones=static_phones, single_url=single_url,
+                include_header=include_header, include_footer=include_footer,
+            )
             with jobs_lock:
                 jobs[job_id].status = "done"
                 jobs[job_id].output_path = output_path
@@ -69,11 +74,22 @@ def start():
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "URL must start with http:// or https://"}), 400
 
+    static_phones = request.form.get("static_phones") == "on"
+    include_header = request.form.get("include_header") == "on"
+    include_footer = request.form.get("include_footer") == "on"
+    single_url = request.form.get("single_url", "").strip() or None
+    if single_url and not single_url.startswith(("http://", "https://")):
+        return jsonify({"error": "Single page URL must start with http:// or https://"}), 400
+
     job_id = str(uuid.uuid4())
     with jobs_lock:
         jobs[job_id] = Job(id=job_id, status="pending")
 
-    t = threading.Thread(target=_run_job, args=(job_id, url), daemon=True)
+    t = threading.Thread(
+        target=_run_job,
+        args=(job_id, url, static_phones, single_url, include_header, include_footer),
+        daemon=True,
+    )
     t.start()
 
     return jsonify({"job_id": job_id}), 202
