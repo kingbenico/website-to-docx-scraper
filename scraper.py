@@ -7,6 +7,7 @@ Driver is created inside run_scrape() — no module-level side effects.
 import json
 import os
 import re
+import tempfile
 import time
 import requests
 from urllib.parse import urljoin, urlparse, unquote
@@ -65,7 +66,11 @@ def make_driver():
     chrome_options.add_argument("--mute-audio")
     chrome_options.add_argument("--no-first-run")
     chrome_options.add_argument("--safebrowsing-disable-auto-update")
-    chrome_options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    # Unique throwaway profile per run. A shared/persistent --user-data-dir can
+    # be left locked between runs on Render, which makes Chrome start in a
+    # degraded state where driver.get() silently fails — breaking the sitemap
+    # browser fallback.
+    chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='chrome-')}")
     return webdriver.Chrome(options=chrome_options)
 
 # ==============================
@@ -109,12 +114,15 @@ def find_sitemap_urls(base_url, driver=None, log=print):
 
     if driver is not None:
         log("  [sitemap] Plain HTTP requests found nothing — retrying via browser...")
+        # An in-page XHR is subject to same-origin policy and returns nothing
+        # if the browser hasn't loaded a page on this origin yet. If loading the
+        # homepage fails there's no point firing XHRs — they'd all return '' —
+        # so surface the real error and bail out of the browser fallback.
         try:
-            # An in-page XHR is subject to same-origin policy and returns nothing
-            # if the browser hasn't loaded a page on this origin yet.
             driver.get(base_url)
         except Exception as e:
-            log(f"  [sitemap] Could not load {base_url} in browser: {e}")
+            log(f"  [sitemap] Could not load {base_url} in browser: {e} — skipping browser fallback")
+            return list(set(found_urls))
         for path in candidates:
             url = urljoin(base_url, path)
             try:
@@ -123,7 +131,9 @@ def find_sitemap_urls(base_url, driver=None, log=print):
                     found_urls.append(url)
                     log(f"  [sitemap] {url} -> found via browser")
                 else:
-                    log(f"  [sitemap] {url} -> browser fetch returned no sitemap content")
+                    snippet = (txt or "")[:120].replace("\n", " ")
+                    log(f"  [sitemap] {url} -> browser fetch returned no sitemap content "
+                        f"(len={len(txt or '')}): {snippet!r}")
             except Exception as e:
                 log(f"  [sitemap] {url} -> browser fetch failed: {e}")
 
