@@ -945,7 +945,8 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
 
         company_name = urlparse(base_url).netloc.replace("www.", "")
         safe_name = company_name.replace(".", "_")
-        output_path = f"/tmp/{safe_name}_site_content.docx"
+        # Use the OS temp dir (works on Windows too) instead of a hardcoded /tmp.
+        output_path = os.path.join(tempfile.gettempdir(), f"{safe_name}_site_content.docx")
 
         log("Building DOCX...")
         build_docx(company_name, pages_data, output_path, business_info)
