@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from collections import Counter
 import requests
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
@@ -415,13 +416,19 @@ ADDRESS_HINT_RE = re.compile(
 EMAIL_EXCLUDE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 
 
+def _bump(info, key, value):
+    """Record one occurrence of `value` in the info Counter at `key`."""
+    if value:
+        info[key][value] += 1
+
+
 def _extract_phones(soup, info):
     for a in soup.find_all("a", href=True):
         href = unquote(a["href"].strip())
         if href.lower().startswith("tel:"):
             phone = href[4:].strip()
             if phone:
-                info["phones"].add(phone)
+                _bump(info, "phones", phone)
 
     body = soup.body if soup.body else soup
     text = body.get_text(" ", strip=True)
@@ -429,7 +436,7 @@ def _extract_phones(soup, info):
         candidate = m.group(0).strip()
         digits = re.sub(r"\D", "", candidate)
         if len(digits) in (10, 11):
-            info["phones"].add(candidate)
+            _bump(info, "phones", candidate)
 
 
 def extract_business_info(soup, url, info, skip_phones=False):
@@ -475,11 +482,11 @@ def extract_business_info(soup, url, info, skip_phones=False):
             if not skip_phones:
                 phone = obj.get("telephone")
                 if phone:
-                    info["phones"].add(phone.strip())
+                    _bump(info, "phones", phone.strip())
 
             email = obj.get("email")
             if email:
-                info["emails"].add(email.strip())
+                _bump(info, "emails", email.strip())
 
             addr = obj.get("address")
             if isinstance(addr, dict):
@@ -491,9 +498,9 @@ def extract_business_info(soup, url, info, skip_phones=False):
                 ]
                 full_addr = ", ".join(p.strip() for p in parts if p and p.strip())
                 if full_addr:
-                    info["addresses"].add(full_addr)
+                    _bump(info, "addresses", full_addr)
             elif isinstance(addr, str) and addr.strip():
-                info["addresses"].add(addr.strip())
+                _bump(info, "addresses", addr.strip())
 
     # --- tel: link / plain-text phone scan (skipped when using raw-HTML mode) ---
     if not skip_phones:
@@ -505,7 +512,7 @@ def extract_business_info(soup, url, info, skip_phones=False):
         if href.lower().startswith("mailto:"):
             email = href[7:].split("?")[0].strip()
             if email:
-                info["emails"].add(email)
+                _bump(info, "emails", email)
 
     # --- Plain-text regex scan of visible body text (footer/header often hold this) ---
     body = soup.body if soup.body else soup
@@ -514,10 +521,10 @@ def extract_business_info(soup, url, info, skip_phones=False):
     for m in EMAIL_RE.finditer(text):
         candidate = m.group(0).strip().rstrip(".,;")
         if not candidate.lower().endswith(EMAIL_EXCLUDE_EXTENSIONS):
-            info["emails"].add(candidate)
+            _bump(info, "emails", candidate)
 
     for m in ADDRESS_HINT_RE.finditer(text):
-        info["addresses"].add(m.group(0).strip())
+        _bump(info, "addresses", m.group(0).strip())
 
     # --- Google Maps embed fallback ---
     # Embedded Maps widgets (<gmp-place-details-compact>, older iframe embeds) render the
@@ -560,7 +567,7 @@ def extract_static_phones(url, info):
                 continue
             phone = obj.get("telephone")
             if phone:
-                info["phones"].add(phone.strip())
+                _bump(info, "phones", phone.strip())
 
 
 # ==============================
@@ -757,6 +764,39 @@ def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_
 # DOCX BUILDER
 # ==============================
 
+def _merge_phone_counter(counter):
+    """
+    Collapse phone entries that are the same real number in different formats
+    (e.g. '+18564859091', '(856) 485-9091', '1-856-485-9091', and the buggy
+    '++18564859091') into one entry, summing their occurrences.
+
+    Grouping key is the last 10 digits, so US country-code variants merge.
+    For a US 10/11-digit number the display value is the canonical
+    '(AAA) BBB-CCCC' format; otherwise the most-frequently-seen raw format wins.
+
+    Returns a list of (display_value, total_count) sorted by descending count.
+    """
+    groups = {}  # key -> {"total": int, "variants": Counter}
+    for raw, count in counter.items():
+        digits = re.sub(r"\D", "", raw)
+        key = digits[-10:] if len(digits) >= 10 else digits
+        g = groups.setdefault(key, {"total": 0, "variants": Counter()})
+        g["total"] += count
+        g["variants"][raw] += count
+
+    merged = []
+    for key, g in groups.items():
+        if len(key) == 10:
+            display = f"({key[0:3]}) {key[3:6]}-{key[6:10]}"
+        else:
+            # Non-US / odd length: show the most common raw format as-is.
+            display = g["variants"].most_common(1)[0][0]
+        merged.append((display, g["total"]))
+
+    merged.sort(key=lambda kv: (-kv[1], kv[0]))
+    return merged
+
+
 def build_docx(company_name, pages_data, output_path, business_info=None):
 
     doc = Document()
@@ -777,29 +817,35 @@ def build_docx(company_name, pages_data, output_path, business_info=None):
             p.add_run("Business Name: ").bold = True
             p.add_run(business_info["name"])
 
-        if business_info["phones"]:
-            p = doc.add_paragraph()
-            p.add_run("Phone: ").bold = True
-            p.add_run(", ".join(sorted(business_info["phones"])))
+        # Build the contact-details table rows: (Type, Data, Occurrence).
+        # phones/emails/addresses are Counters {value: times_seen}; sorted by
+        # descending occurrence so the most-common value is first. Map links
+        # carry no meaningful count, so their occurrence cell is left as "-".
+        rows = []
+        # Phones: merge format variants of the same number into one row.
+        for value, count in _merge_phone_counter(business_info.get("phones") or Counter()):
+            rows.append(("Phone", value, str(count)))
+        for label, key in (("Email", "emails"), ("Address", "addresses")):
+            counter = business_info.get(key) or {}
+            for value, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])):
+                rows.append((label, value, str(count)))
+        for link in sorted(business_info.get("map_links", [])):
+            rows.append(("Map Link", link, "-"))
 
-        if business_info["emails"]:
-            p = doc.add_paragraph()
-            p.add_run("Email: ").bold = True
-            p.add_run(", ".join(sorted(business_info["emails"])))
-
-        if business_info["addresses"]:
-            p = doc.add_paragraph()
-            p.add_run("Address: ").bold = True
-            p.add_run(" | ".join(sorted(business_info["addresses"])))
-        elif business_info.get("map_links"):
-            p = doc.add_paragraph()
-            p.add_run("Map Link: ").bold = True
-            p.add_run(" | ".join(sorted(business_info["map_links"])))
-
-        if not any(
-            business_info.get(k)
-            for k in ("name", "phones", "emails", "addresses", "map_links")
-        ):
+        if rows:
+            table = doc.add_table(rows=1, cols=3)
+            table.style = "Table Grid"
+            hdr = table.rows[0].cells
+            for cell, heading in zip(hdr, ("Type", "Data", "Occurrence")):
+                cell.text = ""
+                run = cell.paragraphs[0].add_run(heading)
+                run.bold = True
+            for r_type, r_data, r_occ in rows:
+                cells = table.add_row().cells
+                cells[0].text = r_type
+                cells[1].text = r_data
+                cells[2].text = r_occ
+        else:
             doc.add_paragraph("No business contact details were found on the site.")
 
         doc.add_page_break()
@@ -921,11 +967,14 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
         low_priority_pages = []
         all_urls_list = sorted(all_urls)
 
+        # phones/emails/addresses are Counters so we can report how many times
+        # each value was seen across the scraped pages (occurrence column).
+        # map_links stays a set — no occurrence count needed for it.
         business_info = {
             "name": "",
-            "phones": set(),
-            "emails": set(),
-            "addresses": set(),
+            "phones": Counter(),
+            "emails": Counter(),
+            "addresses": Counter(),
             "map_links": set(),
         }
 

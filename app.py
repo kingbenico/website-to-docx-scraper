@@ -77,13 +77,14 @@ def start():
     static_phones = request.form.get("static_phones") == "on"
     include_header = request.form.get("include_header") == "on"
     include_footer = request.form.get("include_footer") == "on"
-    # Advanced: one or more specific page URLs. The form sends a repeated
-    # "single_url" field (one per row). Collect all non-empty values, preserving
-    # order and dropping duplicates.
-    raw_single = [u.strip() for u in request.form.getlist("single_url")]
+    # Advanced: one or more specific page URLs, pasted as a newline-separated
+    # list in the "single_url" textarea. Split on newlines, trim each, drop
+    # empties/duplicates (order preserved), and validate the scheme.
+    raw_single = request.form.get("single_url", "").splitlines()
     seen = set()
     single_urls = []
-    for u in raw_single:
+    for line in raw_single:
+        u = line.strip()
         if not u or u in seen:
             continue
         if not u.startswith(("http://", "https://")):
