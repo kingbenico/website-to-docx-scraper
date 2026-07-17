@@ -418,6 +418,11 @@ EMAIL_EXCLUDE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 
 def _bump(info, key, value):
     """Record one occurrence of `value` in the info Counter at `key`."""
+    if key == "phones" and value:
+        # Collapse a repeated leading '+' (e.g. a buggy '++18564859091' from a
+        # doubled tel: prefix) down to a single '+'. This does NOT merge distinct
+        # formats — '(856) 485-9091' and '+18564859091' remain separate entries.
+        value = re.sub(r"^\++", "+", value.strip())
     if value:
         info[key][value] += 1
 
@@ -568,6 +573,93 @@ def extract_static_phones(url, info):
             phone = obj.get("telephone")
             if phone:
                 _bump(info, "phones", phone.strip())
+
+
+def _collect_phone_strings(soup):
+    """
+    Return the set of raw phone-number strings found in `soup` (both tel: links
+    and visible text). Used to compare the JS-rendered DOM against the raw HTML
+    so we can tell which numbers were injected by a call-tracking script.
+    """
+    tmp = {"phones": Counter()}
+    _extract_phones(soup, tmp)
+    return set(tmp["phones"].keys())
+
+
+def _swap_dynamic_phones_in_blocks(blocks, static_url, rendered_soup, log):
+    """
+    Replace call-tracking (dynamic) phone numbers in already-extracted text
+    `blocks` with the site's static number.
+
+    A number is "dynamic" if it appears in the JS-rendered DOM but its last-10
+    digits are NOT present in the raw (non-JS) HTML. We only rewrite when there
+    is exactly ONE static number to substitute in, so we never risk mangling a
+    page that legitimately lists several different numbers.
+
+    `blocks` is a list of (tag, text) tuples (as produced by clean_text_blocks
+    / extract_text_blocks). Returns the number of substitutions made.
+    """
+    def digits10(s):
+        d = re.sub(r"\D", "", s)
+        return d[-10:] if len(d) >= 10 else d
+
+    # Static numbers from raw HTML.
+    try:
+        r = requests.get(static_url, timeout=20, headers=HEADERS)
+        if r.status_code != 200:
+            return 0
+        static_soup = BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return 0
+
+    static_strings = _collect_phone_strings(static_soup)
+    static_keys = {digits10(s) for s in static_strings if digits10(s)}
+    if len(static_keys) != 1:
+        # Zero or ambiguous — don't guess. Leave the body untouched.
+        if len(static_keys) > 1:
+            log("  [static-phones] multiple static numbers found — skipping body swap to avoid a wrong replacement")
+        return 0
+    static_key = next(iter(static_keys))
+    # Pick a canonical display string for that static number (the longest raw
+    # form tends to be the most complete, e.g. with area code / punctuation).
+    static_display = sorted(
+        (s for s in static_strings if digits10(s) == static_key), key=len, reverse=True
+    )[0]
+
+    # Dynamic numbers = rendered numbers whose digits aren't the static one.
+    rendered_strings = _collect_phone_strings(rendered_soup)
+    dynamic_strings = {s for s in rendered_strings if digits10(s) and digits10(s) != static_key}
+    if not dynamic_strings:
+        return 0
+
+    def swap(text):
+        new_text = text
+        for dyn in dynamic_strings:
+            if dyn in new_text:
+                new_text = new_text.replace(dyn, static_display)
+        return new_text
+
+    subs = 0
+    new_blocks = []
+    for block in blocks:
+        # Blocks are (tag, text) or, for buttons, (tag, text, href). Both the
+        # visible text (index 1) and a button's href (index 2, e.g.
+        # 'tel:+18564859091') can carry the dynamic number.
+        block = list(block)
+        changed = False
+        for i in range(1, len(block)):
+            if isinstance(block[i], str):
+                swapped = swap(block[i])
+                if swapped != block[i]:
+                    block[i] = swapped
+                    changed = True
+        if changed:
+            subs += 1
+        new_blocks.append(tuple(block))
+    if subs:
+        blocks[:] = new_blocks
+        log(f"  [static-phones] replaced dynamic number(s) with static '{static_display}' in {subs} block(s)")
+    return subs
 
 
 # ==============================
@@ -743,6 +835,14 @@ def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_
 
             content_blocks = clean_text_blocks(soup)
 
+            # With static-phones mode on, the body above was extracted from the
+            # JS-rendered DOM, so it still shows any call-tracking number that a
+            # script swapped in. Rewrite those to the site's static number so the
+            # document body matches the Business Summary.
+            if static_phones:
+                for blk in (content_blocks, header_blocks, footer_blocks):
+                    _swap_dynamic_phones_in_blocks(blk, url, soup, log=print)
+
             return title, content_blocks, driver, header_blocks, footer_blocks
 
         except Exception as e:
@@ -763,39 +863,6 @@ def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_
 # ==============================
 # DOCX BUILDER
 # ==============================
-
-def _merge_phone_counter(counter):
-    """
-    Collapse phone entries that are the same real number in different formats
-    (e.g. '+18564859091', '(856) 485-9091', '1-856-485-9091', and the buggy
-    '++18564859091') into one entry, summing their occurrences.
-
-    Grouping key is the last 10 digits, so US country-code variants merge.
-    For a US 10/11-digit number the display value is the canonical
-    '(AAA) BBB-CCCC' format; otherwise the most-frequently-seen raw format wins.
-
-    Returns a list of (display_value, total_count) sorted by descending count.
-    """
-    groups = {}  # key -> {"total": int, "variants": Counter}
-    for raw, count in counter.items():
-        digits = re.sub(r"\D", "", raw)
-        key = digits[-10:] if len(digits) >= 10 else digits
-        g = groups.setdefault(key, {"total": 0, "variants": Counter()})
-        g["total"] += count
-        g["variants"][raw] += count
-
-    merged = []
-    for key, g in groups.items():
-        if len(key) == 10:
-            display = f"({key[0:3]}) {key[3:6]}-{key[6:10]}"
-        else:
-            # Non-US / odd length: show the most common raw format as-is.
-            display = g["variants"].most_common(1)[0][0]
-        merged.append((display, g["total"]))
-
-    merged.sort(key=lambda kv: (-kv[1], kv[0]))
-    return merged
-
 
 def build_docx(company_name, pages_data, output_path, business_info=None):
 
@@ -822,10 +889,9 @@ def build_docx(company_name, pages_data, output_path, business_info=None):
         # descending occurrence so the most-common value is first. Map links
         # carry no meaningful count, so their occurrence cell is left as "-".
         rows = []
-        # Phones: merge format variants of the same number into one row.
-        for value, count in _merge_phone_counter(business_info.get("phones") or Counter()):
-            rows.append(("Phone", value, str(count)))
-        for label, key in (("Email", "emails"), ("Address", "addresses")):
+        # Phones: keep every distinct format as its own row (no merging), so
+        # variants like '+18564859091' and '(856) 485-9091' are all preserved.
+        for label, key in (("Phone", "phones"), ("Email", "emails"), ("Address", "addresses")):
             counter = business_info.get(key) or {}
             for value, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])):
                 rows.append((label, value, str(count)))
