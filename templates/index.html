@@ -266,6 +266,57 @@
     .advanced-body input[type="url"] {
       margin-top: 0.4rem;
     }
+
+    .single-url-row {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .single-url-row input[type="url"] {
+      flex: 1;
+    }
+
+    .remove-url-btn {
+      flex: 0 0 auto;
+      width: 34px;
+      height: 34px;
+      margin-top: 0.4rem;
+      padding: 0;
+      font-size: 1.1rem;
+      line-height: 1;
+      color: #888;
+      background: #fff;
+      border: 1px solid #e5e5eb;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    .remove-url-btn:hover {
+      color: #c0392b;
+      border-color: #c0392b;
+    }
+
+    /* Hide the remove button when it's the only row — nothing to remove. */
+    #single-url-list .single-url-row:only-child .remove-url-btn {
+      display: none;
+    }
+
+    #add-url-btn {
+      margin-top: 0.6rem;
+      padding: 0.4rem 0.75rem;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #2d5bff;
+      background: #fff;
+      border: 1px solid #cdd6ff;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    #add-url-btn:hover {
+      background: #f0f3ff;
+    }
   </style>
 </head>
 <body>
@@ -315,17 +366,22 @@
       </div>
 
       <details class="advanced">
-        <summary>Advanced: test a single page</summary>
+        <summary>Advanced: scrape specific pages only</summary>
         <div class="advanced-body">
-          <label for="single-url-input">Page URL (optional)</label>
-          <input
-            type="url"
-            id="single-url-input"
-            name="single_url"
-            placeholder="https://example.com/contact/"
-          />
+          <label>Page URLs (optional)</label>
+          <div id="single-url-list">
+            <div class="single-url-row">
+              <input
+                type="url"
+                name="single_url"
+                placeholder="https://example.com/contact/"
+              />
+              <button type="button" class="remove-url-btn" aria-label="Remove this page">&times;</button>
+            </div>
+          </div>
+          <button type="button" id="add-url-btn">+ Add another page</button>
           <span class="checkbox-hint">
-            If set, only this exact page is scraped (the sitemap crawl is skipped) — handy for quickly checking a setting like "static phone numbers" against one page before running the full site. Website URL above is still required — enter the site's base URL there (e.g. https://example.com/), not the page you're testing.
+            If you fill in one or more page URLs here, only those exact pages are scraped and the whole-sitemap crawl is skipped — much faster for large sites when you only need a few pages. Website URL above is still required — enter the site's base URL there (e.g. https://example.com/), not the pages you're targeting.
           </span>
         </div>
       </details>
@@ -418,6 +474,40 @@
           // Network hiccup — keep polling
         });
     }
+
+    // --- Dynamic "specific pages" URL rows ---
+    const urlList = document.getElementById('single-url-list');
+    const addUrlBtn = document.getElementById('add-url-btn');
+
+    function makeUrlRow() {
+      const row = document.createElement('div');
+      row.className = 'single-url-row';
+      const input = document.createElement('input');
+      input.type = 'url';
+      input.name = 'single_url';
+      input.placeholder = 'https://example.com/contact/';
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'remove-url-btn';
+      removeBtn.setAttribute('aria-label', 'Remove this page');
+      removeBtn.innerHTML = '&times;';
+      row.appendChild(input);
+      row.appendChild(removeBtn);
+      return row;
+    }
+
+    addUrlBtn.addEventListener('click', function() {
+      const row = makeUrlRow();
+      urlList.appendChild(row);
+      row.querySelector('input').focus();
+    });
+
+    // Event delegation: remove a row when its × is clicked.
+    urlList.addEventListener('click', function(e) {
+      if (e.target.classList.contains('remove-url-btn')) {
+        e.target.closest('.single-url-row').remove();
+      }
+    });
 
     form.addEventListener('submit', function(e) {
       e.preventDefault();

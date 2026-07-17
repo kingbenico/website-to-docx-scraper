@@ -876,8 +876,10 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
     scripts that swap in a dynamic number after page load are bypassed.
 
     single_url: when provided, skips sitemap discovery/crawling entirely and
-    scrapes only this one URL. Useful for quickly testing extraction changes
-    (e.g. static_phones) against one page instead of the whole site.
+    scrapes only the given URL(s). Accepts either a single URL string or a list
+    of URLs. Useful for targeting specific pages instead of the whole site
+    (e.g. a 447-sitemap site where you only want a handful of pages), or for
+    quickly testing extraction changes (e.g. static_phones) against one page.
 
     include_header / include_footer: when True, each page's <header>/<footer>
     content is extracted separately (normally stripped as boilerplate) and
@@ -893,8 +895,15 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
 
     try:
         if single_url:
-            all_urls = {single_url}
-            log(f"Single-page mode: scraping only {single_url}")
+            # single_url may be a single string or a list of URLs.
+            target_urls = [single_url] if isinstance(single_url, str) else list(single_url)
+            all_urls = set(target_urls)
+            if len(all_urls) == 1:
+                log(f"Single-page mode: scraping only {next(iter(all_urls))}")
+            else:
+                log(f"Specific-pages mode: scraping {len(all_urls)} page(s):")
+                for u in target_urls:
+                    log(f"  - {u}")
         else:
             log("Discovering sitemaps...")
             sitemap_urls = find_sitemap_urls(base_url, driver=driver, log=log)

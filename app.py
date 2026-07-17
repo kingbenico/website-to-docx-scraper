@@ -31,7 +31,7 @@ _scrape_semaphore = threading.Semaphore(1)
 # BACKGROUND WORKER
 # ==============================
 
-def _run_job(job_id: str, url: str, static_phones: bool, single_url: Optional[str],
+def _run_job(job_id: str, url: str, static_phones: bool, single_url,
              include_header: bool, include_footer: bool):
     def log(msg):
         with jobs_lock:
@@ -77,9 +77,20 @@ def start():
     static_phones = request.form.get("static_phones") == "on"
     include_header = request.form.get("include_header") == "on"
     include_footer = request.form.get("include_footer") == "on"
-    single_url = request.form.get("single_url", "").strip() or None
-    if single_url and not single_url.startswith(("http://", "https://")):
-        return jsonify({"error": "Single page URL must start with http:// or https://"}), 400
+    # Advanced: one or more specific page URLs. The form sends a repeated
+    # "single_url" field (one per row). Collect all non-empty values, preserving
+    # order and dropping duplicates.
+    raw_single = [u.strip() for u in request.form.getlist("single_url")]
+    seen = set()
+    single_urls = []
+    for u in raw_single:
+        if not u or u in seen:
+            continue
+        if not u.startswith(("http://", "https://")):
+            return jsonify({"error": f"Page URL must start with http:// or https://: {u}"}), 400
+        seen.add(u)
+        single_urls.append(u)
+    single_url = single_urls or None
 
     job_id = str(uuid.uuid4())
     with jobs_lock:
