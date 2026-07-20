@@ -4,18 +4,25 @@ Refactored from bulk_site_to_docx_selenium.py for use as a library.
 Driver is created inside run_scrape() — no module-level side effects.
 """
 
+import ctypes
 import json
 import os
+import queue
 import re
+import sys
 import tempfile
+import threading
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from urllib.parse import urljoin, urlparse, unquote
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from docx import Document
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -72,7 +79,127 @@ def make_driver():
     # degraded state where driver.get() silently fails — breaking the sitemap
     # browser fallback.
     chrome_options.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='chrome-')}")
-    return webdriver.Chrome(options=chrome_options)
+    driver = webdriver.Chrome(options=chrome_options)
+    # A hung resource on one page shouldn't block the whole scrape forever.
+    driver.set_page_load_timeout(30)
+    driver.set_script_timeout(30)
+    return driver
+
+
+class DriverPool:
+    """
+    Fixed-size pool of Chrome drivers for parallel page scraping. Drivers are
+    created lazily on first checkout, so a single-page job never pays to start
+    N browsers. Uses a queue.Queue (not threading.local) because scrape_page
+    can REPLACE a driver after a crash — a Queue makes returning that
+    replacement to the pool straightforward and correct; thread-local storage
+    would silently leak the old driver if the executor recycles threads.
+    """
+
+    def __init__(self, size, log=print):
+        self.size = max(1, size)
+        self.log = log
+        self._q = queue.Queue()
+        self._all = []
+        self._lock = threading.Lock()
+        self._created = 0
+
+    def seed(self, drv):
+        """Add an already-created driver to the pool instead of starting a new
+        one — used to hand off the sitemap-discovery driver so we never
+        briefly run N+1 Chromes."""
+        with self._lock:
+            self._all.append(drv)
+            self._created += 1
+        self._q.put(drv)
+
+    def acquire(self):
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            pass
+        with self._lock:
+            if self._created < self.size:
+                self._created += 1
+                make_new = True
+            else:
+                make_new = False
+        if make_new:
+            self.log(f"  [pool] starting Chrome #{self._created}/{self.size}")
+            drv = make_driver()
+            with self._lock:
+                self._all.append(drv)
+            return drv
+        return self._q.get()  # all drivers checked out — wait for one to free up
+
+    def release(self, drv):
+        self._q.put(drv)
+
+    def replace(self, old, new):
+        """scrape_page returned a different driver than it was given (crash restart)."""
+        with self._lock:
+            if old in self._all:
+                self._all.remove(old)
+            self._all.append(new)
+
+    def shutdown(self):
+        with self._lock:
+            drivers, self._all = self._all, []
+        for d in drivers:
+            try:
+                d.quit()
+            except Exception:
+                pass
+
+
+def _total_ram_mb():
+    """Best-effort total system RAM in MB, without adding a psutil dependency
+    (kept out to avoid bloating the PyInstaller desktop build)."""
+    try:
+        if sys.platform == "win32":
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return stat.ullTotalPhys / (1024 * 1024)
+        else:
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            page_count = os.sysconf("SC_PHYS_PAGES")
+            return (page_size * page_count) / (1024 * 1024)
+    except Exception:
+        return 2048  # safe fallback: assume a modest 2GB
+
+
+def _default_workers():
+    """
+    How many Chrome instances to run in parallel. Priority order:
+    1. SCRAPER_WORKERS env var (explicit override, e.g. set to 1 on Render).
+    2. Derived from total RAM (~700MB budget per Chrome instance) and CPU
+       count, capped at 4. Returns 1 below 1GB RAM so this never OOMs
+       Render's 512MB free tier by defaulting to multiple browsers there.
+    """
+    env = os.environ.get("SCRAPER_WORKERS")
+    if env:
+        try:
+            return max(1, min(8, int(env)))
+        except ValueError:
+            pass
+    total_mb = _total_ram_mb()
+    if total_mb < 1024:
+        return 1
+    cpu = os.cpu_count() or 2
+    return max(1, min(4, cpu // 2, int(total_mb // 700)))
 
 # ==============================
 # SITEMAP
@@ -194,13 +321,81 @@ def parse_sitemap(url, collected, driver=None, log=print):
 # PAGE INTERACTION
 # ==============================
 
-def smart_scroll(driver):
+def smart_scroll(driver, max_steps=30, settle=0.15, stable_needed=2):
+    """
+    Scroll to the bottom, continuing while scrollHeight keeps growing (lazy
+    loaders extend it as we go). Exits once height is stable AND we're at the
+    bottom for `stable_needed` consecutive checks, instead of a fixed step
+    count — most pages finish in a handful of steps, and unlike the old fixed
+    14-step version, long pages are no longer truncated at ~15k px.
+    """
     try:
-        for _ in range(14):
+        stable = 0
+        last_height = driver.execute_script("return document.body.scrollHeight;")
+        for _ in range(max_steps):
             driver.execute_script("window.scrollBy(0, window.innerHeight);")
-            time.sleep(0.6)
+            time.sleep(settle)
+            height, y, inner_h = driver.execute_script(
+                "return [document.body.scrollHeight, window.pageYOffset, window.innerHeight];"
+            )
+            at_bottom = (y + inner_h) >= (height - 5)
+            if height == last_height and at_bottom:
+                stable += 1
+                if stable >= stable_needed:
+                    break
+            else:
+                stable = 0
+            last_height = height
     except Exception:
         pass
+
+
+def wait_dom_stable(driver, quiet=0.4, timeout=3.0):
+    """
+    Poll the rendered DOM size until it stops changing for `quiet` seconds, or
+    `timeout` elapses. Used as a short settle period after JS-driven widgets
+    (sliders, accordions) finish mutating the page.
+    """
+    deadline = time.time() + timeout
+    last_len = -1
+    stable_since = None
+    while time.time() < deadline:
+        try:
+            n = driver.execute_script("return document.body.innerHTML.length;")
+        except Exception:
+            return
+        if n == last_len:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= quiet:
+                return
+        else:
+            stable_since = None
+            last_len = n
+        time.sleep(0.1)
+
+
+def wait_ready(driver, timeout=10, min_wait=0.3):
+    """
+    Replace a blind fixed sleep with an actual readiness check: wait for
+    document.readyState to reach "complete", then (if jQuery is present) for
+    jQuery.active to reach 0, then a small floor for post-load JS injection.
+    """
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState;") == "complete"
+        )
+    except Exception:
+        pass
+    try:
+        WebDriverWait(driver, min(timeout, 5)).until(
+            lambda d: d.execute_script(
+                "return (window.jQuery === undefined) || (jQuery.active === 0);"
+            )
+        )
+    except Exception:
+        pass
+    time.sleep(min_wait)
 
 
 def force_reveal_hidden_content(driver):
@@ -283,45 +478,88 @@ def force_reveal_hidden_content(driver):
 
 
 def expand_dynamic_content(driver):
+    """
+    Open accordions/tabs by clicking. A SINGLE in-page pass: one round-trip
+    total instead of 2 execute_script calls per element, and — critically —
+    only one pass, since a second click pass toggles already-open panels shut
+    again (accordions/<summary> are ON/OFF toggles, not idempotent "open"
+    actions).
+    """
     try:
-        selectors = [
-            ".elementor-tab-title",
-            ".elementor-accordion-title",
-            ".elementor-toggle-title",
-            "[role='tab']",
-            "summary",
-        ]
-
-        for _ in range(2):
-            for sel in selectors:
-                elements = driver.find_elements(By.CSS_SELECTOR, sel)
-                for el in elements:
-                    try:
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({block:'center'});", el
-                        )
-                        driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.25)
-                    except Exception:
-                        pass
+        driver.execute_script(
+            """
+            var sels = ['.elementor-tab-title', '.elementor-accordion-title',
+                        '.elementor-toggle-title', "[role='tab']", 'summary'];
+            sels.forEach(function(sel) {
+                document.querySelectorAll(sel).forEach(function(el) {
+                    try {
+                        // <details><summary> toggles via the .open property,
+                        // not a click (a click would flip it shut).
+                        if (el.tagName === 'SUMMARY' && el.parentElement) {
+                            el.parentElement.open = true;
+                            return;
+                        }
+                        var expanded = el.getAttribute('aria-expanded');
+                        var cls = (el.className && typeof el.className === 'string') ? el.className : '';
+                        if (expanded === 'true' || /active|open|expanded/i.test(cls)) {
+                            return;  // already open — clicking would close it
+                        }
+                        el.click();
+                    } catch (e) {}
+                });
+            });
+            """
+        )
+        time.sleep(0.4)  # one settle for all animations, was 0.25s * N elements
     except Exception:
         pass
 
 
-def activate_sliders(driver):
+SLIDE_SELECTOR = (
+    ".swiper-slide, .slick-slide, .owl-item, .splide__slide, .elementor-carousel-item"
+)
+
+
+def activate_sliders(driver, base_clicks=4, extra_clicks=8, click_delay=0.12, max_arrows=6):
+    """
+    Nudge carousels a few times so lazily-created slides get instantiated.
+    force_reveal_hidden_content() already CSS-forces every EXISTING slide to
+    display:block/visible/opacity:1, so for plain text extraction full 20x
+    cycling is unnecessary — all slides already sit in the DOM. The one case
+    that still needs clicking is a carousel that creates slide elements on
+    demand; we detect that by counting slides before/after a small number of
+    clicks and only escalate if the count actually grew.
+    """
     try:
+        before = driver.execute_script(
+            f"return document.querySelectorAll('{SLIDE_SELECTOR}').length;"
+        )
+        if not before:
+            return
+
         arrows = driver.find_elements(
             By.CSS_SELECTOR,
             ".swiper-button-next, .slick-next, .elementor-swiper-button-next, "
             ".owl-next, .splide__arrow--next, [aria-label='Next']",
+        )[:max_arrows]
+
+        def click_arrows(times):
+            for arrow in arrows:
+                for _ in range(times):
+                    try:
+                        driver.execute_script("arguments[0].click();", arrow)
+                        time.sleep(click_delay)
+                    except Exception:
+                        break
+
+        click_arrows(base_clicks)
+
+        after = driver.execute_script(
+            f"return document.querySelectorAll('{SLIDE_SELECTOR}').length;"
         )
-        for arrow in arrows:
-            for _ in range(20):
-                try:
-                    driver.execute_script("arguments[0].click();", arrow)
-                    time.sleep(0.4)
-                except Exception:
-                    pass
+        if after > before:
+            # Slides are being created lazily — keep going a bit longer.
+            click_arrows(extra_clicks)
 
         force_reveal_hidden_content(driver)
 
@@ -544,24 +782,50 @@ def extract_business_info(soup, url, info, skip_phones=False):
                 info["map_links"].add(href)
 
 
-def extract_static_phones(url, info):
+_thread_local = threading.local()
+
+
+def _requests_session():
+    """Thread-local requests.Session so connection pooling works safely once
+    pages are fetched from multiple worker threads (Phase 2 parallelism)."""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _thread_local.session = s
+    return s
+
+
+def fetch_static_soup(url):
     """
     Fetch a page's raw HTML via plain HTTP (no browser, no JavaScript at all)
-    and extract phone numbers from it. Used when the user wants the original
-    static phone number rather than one swapped in by a call-tracking script
-    (e.g. CallRail, CallTrackingMetrics) that only runs after JS executes.
+    and parse it. Returns a BeautifulSoup, or None on any failure. Callers
+    that need the raw HTML for multiple purposes (static phone extraction AND
+    the dynamic-phone body swap) should call this ONCE and share the result —
+    fetching per-purpose was issuing up to 4 identical GETs per page.
     """
     try:
-        r = requests.get(url, timeout=20, headers=HEADERS)
+        r = _requests_session().get(url, timeout=20)
         if r.status_code != 200:
-            return
-        soup = BeautifulSoup(r.text, "lxml")
+            return None
+        return BeautifulSoup(r.text, "lxml")
     except Exception:
+        return None
+
+
+def extract_static_phones(static_soup, info):
+    """
+    Extract phone numbers from a page's raw (non-JS) HTML soup. Used when the
+    user wants the original static phone number rather than one swapped in by
+    a call-tracking script (e.g. CallRail, CallTrackingMetrics) that only runs
+    after JS executes. `static_soup` is the result of fetch_static_soup().
+    """
+    if static_soup is None:
         return
 
-    _extract_phones(soup, info)
+    _extract_phones(static_soup, info)
 
-    for script in soup.find_all("script", {"type": "application/ld+json"}):
+    for script in static_soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(script.string or "")
         except Exception:
@@ -586,39 +850,33 @@ def _collect_phone_strings(soup):
     return set(tmp["phones"].keys())
 
 
-def _swap_dynamic_phones_in_blocks(blocks, static_url, rendered_soup, log):
+def _compute_phone_swap(static_soup, rendered_soup, log):
     """
-    Replace call-tracking (dynamic) phone numbers in already-extracted text
-    `blocks` with the site's static number.
+    Compare the raw-HTML (static) soup against the JS-rendered soup and decide
+    what dynamic->static phone substitution, if any, should be applied to the
+    page body. Pure — no HTTP, no block mutation.
 
     A number is "dynamic" if it appears in the JS-rendered DOM but its last-10
-    digits are NOT present in the raw (non-JS) HTML. We only rewrite when there
-    is exactly ONE static number to substitute in, so we never risk mangling a
-    page that legitimately lists several different numbers.
+    digits are NOT present in the raw HTML. We only propose a swap when there
+    is exactly ONE static number, so we never risk mangling a page that
+    legitimately lists several different numbers.
 
-    `blocks` is a list of (tag, text) tuples (as produced by clean_text_blocks
-    / extract_text_blocks). Returns the number of substitutions made.
+    Returns (dynamic_strings, static_display) or (None, None) if no swap
+    should happen.
     """
     def digits10(s):
         d = re.sub(r"\D", "", s)
         return d[-10:] if len(d) >= 10 else d
 
-    # Static numbers from raw HTML.
-    try:
-        r = requests.get(static_url, timeout=20, headers=HEADERS)
-        if r.status_code != 200:
-            return 0
-        static_soup = BeautifulSoup(r.text, "lxml")
-    except Exception:
-        return 0
+    if static_soup is None:
+        return None, None
 
     static_strings = _collect_phone_strings(static_soup)
     static_keys = {digits10(s) for s in static_strings if digits10(s)}
     if len(static_keys) != 1:
-        # Zero or ambiguous — don't guess. Leave the body untouched.
         if len(static_keys) > 1:
             log("  [static-phones] multiple static numbers found — skipping body swap to avoid a wrong replacement")
-        return 0
+        return None, None
     static_key = next(iter(static_keys))
     # Pick a canonical display string for that static number (the longest raw
     # form tends to be the most complete, e.g. with area code / punctuation).
@@ -626,12 +884,22 @@ def _swap_dynamic_phones_in_blocks(blocks, static_url, rendered_soup, log):
         (s for s in static_strings if digits10(s) == static_key), key=len, reverse=True
     )[0]
 
-    # Dynamic numbers = rendered numbers whose digits aren't the static one.
     rendered_strings = _collect_phone_strings(rendered_soup)
     dynamic_strings = {s for s in rendered_strings if digits10(s) and digits10(s) != static_key}
     if not dynamic_strings:
-        return 0
+        return None, None
+    return dynamic_strings, static_display
 
+
+def _apply_phone_swap(blocks, dynamic_strings, static_display):
+    """
+    Apply a precomputed dynamic->static swap to one block list, in place.
+
+    `blocks` is a list of (tag, text) tuples, or (tag, text, href) for
+    buttons — both the visible text (index 1) and a button's href (index 2,
+    e.g. 'tel:+18564859091') can carry the dynamic number. Returns the number
+    of blocks changed.
+    """
     def swap(text):
         new_text = text
         for dyn in dynamic_strings:
@@ -642,9 +910,6 @@ def _swap_dynamic_phones_in_blocks(blocks, static_url, rendered_soup, log):
     subs = 0
     new_blocks = []
     for block in blocks:
-        # Blocks are (tag, text) or, for buttons, (tag, text, href). Both the
-        # visible text (index 1) and a button's href (index 2, e.g.
-        # 'tel:+18564859091') can carry the dynamic number.
         block = list(block)
         changed = False
         for i in range(1, len(block)):
@@ -658,7 +923,6 @@ def _swap_dynamic_phones_in_blocks(blocks, static_url, rendered_soup, log):
         new_blocks.append(tuple(block))
     if subs:
         blocks[:] = new_blocks
-        log(f"  [static-phones] replaced dynamic number(s) with static '{static_display}' in {subs} block(s)")
     return subs
 
 
@@ -798,57 +1062,43 @@ def clean_text_blocks(soup):
 # ==============================
 
 def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_phones=False,
-                 include_header=False, include_footer=False):
-    for _ in range(max_retries):
-        try:
-            driver.get(url)
-            time.sleep(wait_time)
+                 include_header=False, include_footer=False, log=print):
+    """
+    Navigate to `url`, let JS-driven content render, and extract its text.
 
+    The retry loop only covers navigation/rendering (driver.get + widget
+    interaction) — those can be transient (a slow load, a crashed tab) and are
+    worth retrying. Parsing/extraction runs exactly once afterward: it's
+    deterministic, so retrying it just re-runs the same interaction cost for
+    the same result.
+    """
+    page_source = None
+    for attempt in range(max_retries):
+        try:
+            try:
+                driver.get(url)
+            except TimeoutException:
+                log(f"  [timeout] {url} exceeded page load timeout — extracting what rendered")
+                try:
+                    driver.execute_script("window.stop();")
+                except Exception:
+                    pass
+
+            wait_ready(driver, timeout=max(10, wait_time * 3), min_wait=min(wait_time, 0.3))
             smart_scroll(driver)
             expand_dynamic_content(driver)
             force_reveal_hidden_content(driver)
             activate_sliders(driver)
-            smart_scroll(driver)
+            wait_dom_stable(driver)
 
-            soup = BeautifulSoup(driver.page_source, "lxml")
-            title = soup.title.string.strip() if soup.title else url
+            page_source = driver.page_source
+            break
 
-            # Business info (phone/email/address) often lives in header/footer/nav,
-            # which clean_text_blocks() strips — extract it first, before that mutation.
-            if business_info is not None:
-                extract_business_info(soup, url, business_info, skip_phones=static_phones)
-                if static_phones:
-                    # Fetch raw (non-JS) HTML so any call-tracking script that swaps
-                    # in a dynamic number after page load can't affect the result.
-                    extract_static_phones(url, business_info)
-
-            # Header/footer content, if requested — must run before clean_text_blocks()
-            # decomposes <header>/<footer> tags out of the soup.
-            header_blocks = []
-            footer_blocks = []
-            if include_header:
-                for tag in soup.find_all("header"):
-                    header_blocks.extend(extract_text_blocks(tag, strip_forms=False))
-            if include_footer:
-                for tag in soup.find_all("footer"):
-                    footer_blocks.extend(extract_text_blocks(tag, strip_forms=False))
-
-            content_blocks = clean_text_blocks(soup)
-
-            # With static-phones mode on, the body above was extracted from the
-            # JS-rendered DOM, so it still shows any call-tracking number that a
-            # script swapped in. Rewrite those to the site's static number so the
-            # document body matches the Business Summary.
-            if static_phones:
-                for blk in (content_blocks, header_blocks, footer_blocks):
-                    _swap_dynamic_phones_in_blocks(blk, url, soup, log=print)
-
-            return title, content_blocks, driver, header_blocks, footer_blocks
-
-        except Exception as e:
-            print(f"Retry for {url}: {e}")
-            if "tab crashed" in str(e).lower() or "session" in str(e).lower():
-                print("  Browser crash detected — restarting Chrome...")
+        except WebDriverException as e:
+            msg = str(e).lower()
+            log(f"  Retry {attempt + 1}/{max_retries} for {url}: {e}")
+            if "tab crashed" in msg or "session" in msg or "disconnected" in msg:
+                log("  Browser crash detected — restarting Chrome...")
                 try:
                     driver.quit()
                 except Exception:
@@ -856,9 +1106,61 @@ def scrape_page(driver, url, wait_time, max_retries, business_info=None, static_
                 time.sleep(2)
                 driver = make_driver()
             else:
-                time.sleep(2)
+                time.sleep(1)
 
-    return url, [], driver, [], []
+    if page_source is None:
+        return url, [], driver, [], []
+
+    # --- Parsing/extraction: deterministic, never retried ---
+    try:
+        soup = BeautifulSoup(page_source, "lxml")
+        title = soup.title.string.strip() if soup.title else url
+
+        # Fetch raw (non-JS) HTML once, up front, and share it for both static
+        # phone extraction and the dynamic->static body swap below — avoids
+        # issuing multiple identical GETs for the same URL.
+        static_soup = fetch_static_soup(url) if static_phones else None
+
+        # Business info (phone/email/address) often lives in header/footer/nav,
+        # which clean_text_blocks() strips — extract it first, before that mutation.
+        if business_info is not None:
+            extract_business_info(soup, url, business_info, skip_phones=static_phones)
+            if static_phones:
+                extract_static_phones(static_soup, business_info)
+
+        # Header/footer content, if requested — must run before clean_text_blocks()
+        # decomposes <header>/<footer> tags out of the soup.
+        header_blocks = []
+        footer_blocks = []
+        if include_header:
+            for tag in soup.find_all("header"):
+                header_blocks.extend(extract_text_blocks(tag, strip_forms=False))
+        if include_footer:
+            for tag in soup.find_all("footer"):
+                footer_blocks.extend(extract_text_blocks(tag, strip_forms=False))
+
+        content_blocks = clean_text_blocks(soup)
+
+        # With static-phones mode on, the body above was extracted from the
+        # JS-rendered DOM, so it still shows any call-tracking number that a
+        # script swapped in. Rewrite those to the site's static number so the
+        # document body matches the Business Summary.
+        if static_phones and static_soup is not None:
+            dynamic_strings, static_display = _compute_phone_swap(static_soup, soup, log=log)
+            if dynamic_strings:
+                total = sum(
+                    _apply_phone_swap(blk, dynamic_strings, static_display)
+                    for blk in (content_blocks, header_blocks, footer_blocks)
+                )
+                if total:
+                    log(f"  [static-phones] replaced dynamic number(s) with static "
+                        f"'{static_display}' in {total} block(s)")
+
+        return title, content_blocks, driver, header_blocks, footer_blocks
+
+    except Exception as e:
+        log(f"  Parse error for {url} (not retrying): {e}")
+        return url, [], driver, [], []
 
 # ==============================
 # DOCX BUILDER
@@ -976,8 +1278,69 @@ def _add_content_blocks(doc, blocks):
 # PUBLIC ENTRYPOINT
 # ==============================
 
+def _empty_business_info():
+    # phones/emails/addresses are Counters so we can report how many times
+    # each value was seen across the scraped pages (occurrence column).
+    # map_links stays a set — no occurrence count needed for it.
+    return {
+        "name": "",
+        "phones": Counter(),
+        "emails": Counter(),
+        "addresses": Counter(),
+        "map_links": set(),
+    }
+
+
+def _merge_business_info(target, parts, url_order):
+    """
+    Merge per-worker business_info dicts into `target`, walking `url_order` so
+    'name' stays first-write-wins in the same order as the old sequential
+    code — the merged result is deterministic and independent of which worker
+    thread happened to finish first.
+    """
+    for url in url_order:
+        info = parts.get(url)
+        if not info:
+            continue
+        if not target["name"] and info["name"]:
+            target["name"] = info["name"]
+        target["phones"] += info["phones"]
+        target["emails"] += info["emails"]
+        target["addresses"] += info["addresses"]
+        target["map_links"] |= info["map_links"]
+
+
+def _scrape_one(pool, url, wait_time, max_retries, static_phones,
+                 include_header, include_footer, log):
+    """Runs on a pool worker thread: check out a driver, scrape one page with
+    its own business_info, return the driver (or its crash-restart
+    replacement) to the pool."""
+    local_info = _empty_business_info()
+    drv = pool.acquire()
+    try:
+        title, content, new_drv, header_blocks, footer_blocks = scrape_page(
+            drv, url, wait_time, max_retries,
+            business_info=local_info, static_phones=static_phones,
+            include_header=include_header, include_footer=include_footer,
+            log=log,
+        )
+        if new_drv is not drv:
+            pool.replace(drv, new_drv)
+            drv = new_drv
+        page_obj = {
+            "url": url,
+            "title": title,
+            "content": content,
+            "header": header_blocks,
+            "footer": footer_blocks,
+        }
+        return page_obj, local_info
+    finally:
+        pool.release(drv)
+
+
 def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, static_phones=False,
-               single_url=None, include_header=False, include_footer=False):
+               single_url=None, include_header=False, include_footer=False, workers=None):
     """
     Run the full scrape pipeline for base_url.
     Returns the absolute path to the generated .docx file.
@@ -996,11 +1359,18 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
     include_header / include_footer: when True, each page's <header>/<footer>
     content is extracted separately (normally stripped as boilerplate) and
     rendered under a "Header"/"Footer" heading in the docx.
+
+    workers: number of Chrome instances to run in parallel. Defaults to an
+    auto-detected value based on available RAM (see _default_workers) —
+    forced to 1 on low-memory hosts like Render's free tier.
     """
+    _log_lock = threading.Lock()
+
     def log(msg):
-        print(msg)
-        if progress_callback:
-            progress_callback(msg)
+        with _log_lock:
+            print(msg)
+            if progress_callback:
+                progress_callback(msg)
 
     log("Starting browser...")
     driver = make_driver()
@@ -1029,37 +1399,62 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
 
         log(f"Found {len(all_urls)} URLs to scrape.")
 
+        all_urls_list = sorted(all_urls)
+        business_info = _empty_business_info()
+
+        num_workers = workers or _default_workers()
+        if len(all_urls_list) == 1:
+            num_workers = 1  # never spin up a pool for a single page
+
+        # The sitemap-discovery driver becomes the pool's first member instead
+        # of being quit and re-created, so we never briefly run N+1 Chromes.
+        pool = DriverPool(num_workers, log=log)
+        pool.seed(driver)
+
+        log(f"Scraping with {num_workers} parallel browser(s)...")
+
+        results = {}
+        infos = {}
+        completed = 0
+        progress_lock = threading.Lock()
+
+        try:
+            with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="scrape") as ex:
+                futures = {
+                    ex.submit(
+                        _scrape_one, pool, url, wait_time, max_retries,
+                        static_phones, include_header, include_footer, log,
+                    ): url
+                    for url in all_urls_list
+                }
+                for fut in as_completed(futures):
+                    url = futures[fut]
+                    try:
+                        page_obj, local_info = fut.result()
+                    except Exception as e:
+                        log(f"  [error] {url}: {e}")
+                        page_obj = {"url": url, "title": url, "content": [], "header": [], "footer": []}
+                        local_info = None
+                    results[url] = page_obj
+                    if local_info:
+                        infos[url] = local_info
+                    with progress_lock:
+                        completed += 1
+                        log(f"[{completed}/{len(all_urls_list)}] Done {url}")
+        finally:
+            pool.shutdown()
+            driver = None  # already quit via pool.shutdown()
+
+        _merge_business_info(business_info, infos, all_urls_list)
+
+        # Rebuild deterministic order + normal/low-priority split from
+        # all_urls_list, since results arrive in completion order, not URL order.
         normal_pages = []
         low_priority_pages = []
-        all_urls_list = sorted(all_urls)
-
-        # phones/emails/addresses are Counters so we can report how many times
-        # each value was seen across the scraped pages (occurrence column).
-        # map_links stays a set — no occurrence count needed for it.
-        business_info = {
-            "name": "",
-            "phones": Counter(),
-            "emails": Counter(),
-            "addresses": Counter(),
-            "map_links": set(),
-        }
-
-        for i, url in enumerate(all_urls_list, 1):
-            log(f"[{i}/{len(all_urls_list)}] Scraping {url}")
-            title, content, driver, header_blocks, footer_blocks = scrape_page(
-                driver, url, wait_time, max_retries,
-                business_info=business_info, static_phones=static_phones,
-                include_header=include_header, include_footer=include_footer,
-            )
-
-            page_obj = {
-                "url": url,
-                "title": title,
-                "content": content,
-                "header": header_blocks,
-                "footer": footer_blocks,
-            }
-
+        for url in all_urls_list:
+            page_obj = results.get(url)
+            if page_obj is None:
+                continue
             if any(p in url.lower() for p in LOW_PRIORITY_PATTERNS):
                 low_priority_pages.append(page_obj)
             else:
@@ -1079,7 +1474,8 @@ def run_scrape(base_url, wait_time=3, max_retries=3, progress_callback=None, sta
         return output_path
 
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
